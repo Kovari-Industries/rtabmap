@@ -70,6 +70,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #include <pcl/TextureMesh.h>
 
 #include <stdlib.h>
+#include <cmath>
 #include <set>
 
 #define LOG_F "LogF.txt"
@@ -90,6 +91,20 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 namespace rtabmap
 {
+
+namespace {
+static float manhattanWrap0ToPi(float a)
+{
+	while(a < 0.0f) a += (float)CV_PI;
+	while(a >= (float)CV_PI) a -= (float)CV_PI;
+	return a;
+}
+
+static float manhattanWrapToPi(float a)
+{
+	return std::atan2(std::sin(a), std::cos(a));
+}
+}
 
 Rtabmap::Rtabmap() :
 	_publishStats(Parameters::defaultRtabmapPublishStats()),
@@ -170,6 +185,9 @@ Rtabmap::Rtabmap() :
 	_foutFloat(0),
 	_foutInt(0),
 	_wDir(""),
+	_manhattanTheta0(0.0f),
+	_manhattanTheta0Confidence(0.0f),
+	_manhattanWallCount(0),
 	_mapCorrection(Transform::getIdentity()),
 	_lastLocalizationNodeId(0),
 	_currentSessionHasGPS(false),
@@ -183,6 +201,118 @@ Rtabmap::Rtabmap() :
 	,_python(new PythonInterface())
 #endif
 {
+}
+
+void Rtabmap::extractManhattanWallObservations(const Signature & signature)
+{
+	if(_manhattanWallObservations.find(signature.id()) != _manhattanWallObservations.end())
+	{
+		return;
+	}
+
+	LaserScan scan = signature.sensorData().laserScanRaw();
+	if(scan.isEmpty() || scan.is2d())
+	{
+		return;
+	}
+
+	pcl::PointCloud<pcl::PointXYZ>::Ptr cloud = util3d::laserScanToPointCloud(scan, scan.localTransform());
+	cloud = util3d::removeNaNFromPointCloud(cloud);
+	if(!cloud.get() || cloud->size() < 800)
+	{
+		return;
+	}
+
+	cloud = util3d::voxelize(cloud, 0.08f);
+	if(!cloud.get() || cloud->size() < 500)
+	{
+		return;
+	}
+
+	std::vector<ManhattanWallObservation> observations;
+	pcl::PointCloud<pcl::PointXYZ>::Ptr remaining(new pcl::PointCloud<pcl::PointXYZ>(*cloud));
+
+	const int maxPlanes = 4;
+	const int minPlaneInliers = 250;
+	const float planeDistanceThreshold = 0.05f;
+	const float wallVerticalityZ = 0.2f; // |n.z| < threshold => normal is close to horizontal
+
+	for(int i=0; i<maxPlanes && remaining.get() && remaining->size() >= 500; ++i)
+	{
+		pcl::ModelCoefficients coefficients;
+		pcl::IndicesPtr inliers = util3d::extractPlane(remaining, planeDistanceThreshold, 200, &coefficients);
+		if(!inliers.get() || (int)inliers->size() < minPlaneInliers || coefficients.values.size() < 4)
+		{
+			break;
+		}
+
+		Eigen::Vector3f n(coefficients.values[0], coefficients.values[1], coefficients.values[2]);
+		float norm = n.norm();
+		if(norm > 1e-6f)
+		{
+			n /= norm;
+			if(std::fabs(n.z()) < wallVerticalityZ)
+			{
+				float alpha = std::atan2(n.y(), n.x());
+				alpha = manhattanWrap0ToPi(alpha);
+				observations.push_back(ManhattanWallObservation(alpha, (float)inliers->size()));
+			}
+		}
+
+		remaining = util3d::extractIndices(remaining, inliers, true, false);
+	}
+
+	if(!observations.empty())
+	{
+		_manhattanWallObservations.insert(std::make_pair(signature.id(), observations));
+	}
+}
+
+void Rtabmap::updateManhattanTheta0FromOptimizedPoses()
+{
+	double csum = 0.0;
+	double ssum = 0.0;
+	double wsum = 0.0;
+	int count = 0;
+
+	for(std::map<int, std::vector<ManhattanWallObservation> >::const_iterator iter=_manhattanWallObservations.begin();
+		iter!=_manhattanWallObservations.end();
+		++iter)
+	{
+		std::map<int, Transform>::const_iterator pter = _optimizedPoses.find(iter->first);
+		if(pter == _optimizedPoses.end())
+		{
+			continue;
+		}
+
+		float roll, pitch, yaw;
+		pter->second.getEulerAngles(roll, pitch, yaw);
+
+		for(size_t k=0; k<iter->second.size(); ++k)
+		{
+			const ManhattanWallObservation & o = iter->second[k];
+			double phi = (double)yaw + (double)o.alpha; // world wall-normal angle
+			double beta = 2.0 * phi; // 90-degree periodicity
+			double w = (double)o.weight;
+			csum += w * std::cos(beta);
+			ssum += w * std::sin(beta);
+			wsum += w;
+			++count;
+		}
+	}
+
+	_manhattanWallCount = count;
+	if(wsum <= 0.0)
+	{
+		_manhattanTheta0Confidence = 0.0f;
+		return;
+	}
+
+	_manhattanTheta0 = 0.5f * (float)std::atan2(ssum, csum);
+	_manhattanTheta0 = manhattanWrapToPi(_manhattanTheta0);
+
+	double mag = std::sqrt(csum*csum + ssum*ssum);
+	_manhattanTheta0Confidence = (float)(mag / wsum);
 }
 
 Rtabmap::~Rtabmap() {
@@ -363,6 +493,10 @@ void Rtabmap::init(const ParametersMap & parameters, const std::string & databas
 
 	_optimizedPoses.clear();
 	_constraints.clear();
+	_manhattanWallObservations.clear();
+	_manhattanTheta0 = 0.0f;
+	_manhattanTheta0Confidence = 0.0f;
+	_manhattanWallCount = 0;
 	_globalScanMap.clear();
 	_globalScanMapPoses.clear();
 	_odomCachePoses.clear();
@@ -485,6 +619,10 @@ void Rtabmap::close(bool databaseSaved, const std::string & ouputDatabasePath)
 
 	_globalScanMap.clear();
 	_globalScanMapPoses.clear();
+	_manhattanWallObservations.clear();
+	_manhattanTheta0 = 0.0f;
+	_manhattanTheta0Confidence = 0.0f;
+	_manhattanWallCount = 0;
 
 	_nodesToRepublish.clear();
 
@@ -531,6 +669,10 @@ void Rtabmap::close(bool databaseSaved, const std::string & ouputDatabasePath)
 		_memory = 0;
 	}
 	_optimizedPoses.clear();
+	_manhattanWallObservations.clear();
+	_manhattanTheta0 = 0.0f;
+	_manhattanTheta0Confidence = 0.0f;
+	_manhattanWallCount = 0;
 	_lastLocalizationPose.setNull();
 
 	if(_bayesFilter)
@@ -1095,6 +1237,10 @@ void Rtabmap::resetMemory()
 	_someNodesHaveBeenTransferred = false;
 	_optimizedPoses.clear();
 	_constraints.clear();
+	_manhattanWallObservations.clear();
+	_manhattanTheta0 = 0.0f;
+	_manhattanTheta0Confidence = 0.0f;
+	_manhattanWallCount = 0;
 	_mapCorrection.setIdentity();
 	_mapCorrectionBackup.setNull();
 	_lastLocalizationPose.setNull();
@@ -1479,6 +1625,7 @@ bool Rtabmap::process(
 	{
 		UFATAL("Not supposed to be here...last signature is null?!?");
 	}
+	extractManhattanWallObservations(*signature);
 
 	ULOGGER_INFO("Processing signature %d w=%d map=%d", signature->id(), signature->getWeight(), signature->mapId());
 	timeMemoryUpdate = timer.ticks();
@@ -4040,6 +4187,18 @@ bool Rtabmap::process(
 	// prepare statistics
 	if(_loopClosureHypothesis.first || _publishStats)
 	{
+		updateManhattanTheta0FromOptimizedPoses();
+		statistics_.addStatistic("Manhattan/Theta0/deg", _manhattanTheta0 * 180.0f / (float)CV_PI);
+		statistics_.addStatistic("Manhattan/Theta0_confidence", _manhattanTheta0Confidence);
+		statistics_.addStatistic("Manhattan/Wall_observations", (float)_manhattanWallCount);
+		if(_manhattanWallCount > 0)
+		{
+			statistics_.addStatistic("Manhattan/Axis0/deg", manhattanWrapToPi(_manhattanTheta0) * 180.0f / (float)CV_PI);
+			statistics_.addStatistic("Manhattan/Axis1/deg", manhattanWrapToPi(_manhattanTheta0 + 0.5f*(float)CV_PI) * 180.0f / (float)CV_PI);
+			statistics_.addStatistic("Manhattan/Axis2/deg", manhattanWrapToPi(_manhattanTheta0 + 1.0f*(float)CV_PI) * 180.0f / (float)CV_PI);
+			statistics_.addStatistic("Manhattan/Axis3/deg", manhattanWrapToPi(_manhattanTheta0 + 1.5f*(float)CV_PI) * 180.0f / (float)CV_PI);
+		}
+
 		ULOGGER_INFO("sending stats...");
 		statistics_.setRefImageId(_memory->getLastSignatureId()); // Use last id from Memory (in case of rehearsal)
 		statistics_.setRefImageMapId(signature->mapId());

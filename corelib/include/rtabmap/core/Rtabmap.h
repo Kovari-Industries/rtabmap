@@ -248,6 +248,14 @@ public:
 											const std::map<int, float> & likelihood) const;
 
 private:
+	struct ManhattanWallObservation
+	{
+		ManhattanWallObservation() : alpha(0.0f), weight(0.0f) {}
+		ManhattanWallObservation(float alpha_, float weight_) : alpha(alpha_), weight(weight_) {}
+		float alpha;
+		float weight;
+	};
+
 	void optimizeCurrentMap(int id,
 			bool lookInDatabase,
 			std::map<int, Transform> & optimizedPoses,
@@ -268,6 +276,8 @@ private:
 	bool computePath(int targetNode, std::map<int, Transform> nodes, const std::multimap<int, rtabmap::Link> & constraints);
 
 	void createGlobalScanMap();
+	void extractManhattanWallObservations(const Signature & signature);
+	void updateManhattanTheta0FromOptimizedPoses();
 
 	void setupLogFiles(bool overwrite = false);
 	void flushStatisticLogs();
@@ -367,6 +377,10 @@ private:
 
 	std::map<int, Transform> _optimizedPoses;
 	std::multimap<int, Link> _constraints;
+	std::map<int, std::vector<ManhattanWallObservation> > _manhattanWallObservations;
+	float _manhattanTheta0;
+	float _manhattanTheta0Confidence;
+	int _manhattanWallCount;
 	Transform _mapCorrection;
 	Transform _mapCorrectionBackup; // used in localization mode when odom is lost
 	Transform _lastLocalizationPose; // Corrected odometry pose. In mapping mode, this corresponds to last pose return by getLocalOptimizedPoses().
